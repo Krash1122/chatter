@@ -1,7 +1,7 @@
 # Chatter
 
 A real-time messaging app I built to get hands-on with full-stack, real-time
-systems — one-to-one and group chats, image sharing, and live message status
+systems, one-to-one and group chats, image sharing, and live message status
 (sent → delivered → seen), the way WhatsApp/iMessage-style ticks work.
 
 **Stack:** React (Vite) · Node.js/Express · Socket.IO · PostgreSQL
@@ -33,19 +33,19 @@ a DM as "a group of two" collapsed that into one code path.
 
 **Delivery status lives in its own table, not a column on `messages`.**
 My first instinct was `messages.status = 'delivered'`. That breaks the
-moment you add group chats — one message can be seen by one person and
+moment you add group chats, one message can be seen by one person and
 merely delivered to another, at the same time, so a single column can't
 represent it. I ended up with `message_status(message_id, user_id, status)`,
 one row per recipient, and the "status" the sender sees is computed by
 aggregating those rows (seen only once *everyone* has seen it).
 
 **Optimistic UI, reconciled by a `client_temp_id`.** When you hit send, the
-message appears instantly with a clock icon — before the server has even
+message appears instantly with a clock icon, before the server has even
 responded. The client generates a temporary ID, sends it along with the
 message, and when the server's real message comes back (via the socket ack
 *and* the room broadcast, which can both arrive), the client swaps the
 temp bubble for the real one by matching that ID instead of rendering it
-twice. Getting this to not double- or lose messages was the fiddliest part
+twice. Getting this to not double, or lose messages was the fiddliest part
 of the whole build.
 
 **Images go over REST, not the socket.** Everything else is a socket event,
@@ -70,7 +70,7 @@ users ──< conversation_participants >── conversations ──< messages �
 
 ### Real-time flow (`server/src/sockets/index.js`)
 
-This file is the core of the app — everything about "is this message
+This file is the core of the app, everything about "is this message
 delivered yet" happens here:
 
 1. The client connects with a JWT (`io(url, { auth: { token } })`). The
