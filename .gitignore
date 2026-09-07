@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+server/node_modules/
+client/node_modules/
+
+# Environment variables
+.env
+server/.env
+
+# Build output
+client/dist/
+client/build/
+
+# Uploaded images (don't commit user content)
+server/src/uploads/*
+!server/src/uploads/.gitkeep
+
+# Logs
+npm-debug.log*
+*.log
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
