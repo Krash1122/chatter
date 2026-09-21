@@ -1,9 +1,9 @@
 // Holds the logged-in user + token, persists the token to localStorage so a
 // page refresh doesn't log you out, and owns connecting/disconnecting the
-// shared socket whenever auth state changes.
+// shared Pusher connection whenever auth state changes.
 import { createContext, useContext, useEffect, useState, useCallback } from 'react';
 import api from '../api/client';
-import { connectSocket, disconnectSocket } from '../api/socket';
+import { connectRealtime, disconnectRealtime } from '../api/realtime';
 
 const AuthContext = createContext(null);
 
@@ -17,13 +17,14 @@ export function AuthProvider({ children }) {
       setLoading(false);
       return;
     }
-    connectSocket(token);
+    connectRealtime(token);
     api
       .get('/auth/me')
       .then(({ data }) => setUser(data.user))
       .catch(() => {
         // Token expired/invalid -- drop it and force a re-login.
         localStorage.removeItem('chatter_token');
+        disconnectRealtime();
         setToken(null);
       })
       .finally(() => setLoading(false));
@@ -33,12 +34,12 @@ export function AuthProvider({ children }) {
     localStorage.setItem('chatter_token', jwt);
     setToken(jwt);
     setUser(userData);
-    connectSocket(jwt);
+    connectRealtime(jwt);
   }, []);
 
   const logout = useCallback(() => {
     localStorage.removeItem('chatter_token');
-    disconnectSocket();
+    disconnectRealtime();
     setToken(null);
     setUser(null);
   }, []);

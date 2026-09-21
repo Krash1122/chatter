@@ -1,201 +1,177 @@
 # Chatter
 
-A real-time messaging app I built to get hands-on with full-stack, real-time
-systems, one-to-one and group chats, image sharing, and live message status
-(sent → delivered → seen), the way WhatsApp/iMessage-style ticks work.
+A real-time messaging app with one-to-one and group chats, image sharing,
+typing indicators, and live message status (sending, sent, delivered, seen).
+Built with React, Express, PostgreSQL and Pusher, deployed on Vercel.
 
-**Stack:** React (Vite) · Node.js/Express · Socket.IO · PostgreSQL
+## Why I made it
 
-## Features
+I wanted to challenge myself and find out how hard it actually is to build
+the texting part of social media. Every app I use has it, it looks simple,
+and I assumed that meant it was simple. It isn't. The moment you ask what
+"delivered" really means, or what happens when one person in a group has
+read a message and another hasn't, or how the little ticks on the sender's
+screen update without them refreshing, the whole thing opens up. That gap
+between "looks obvious" and "is obvious" was the reason I picked it.
 
-- One-to-one **and** group conversations
-- Real-time messaging over WebSockets (Socket.IO), not polling
-- Per-message delivery status: sending → sent → delivered → seen, tracked
-  *per recipient* so a group chat can show a message as seen by one person
-  and only delivered to another
-- Image sharing
-- Typing indicators and online/offline presence
-- JWT authentication with bcrypt-hashed passwords
+## How I built it
 
-## Why I built it this way
+**The database.** Everything hangs off one `conversations` table. A direct
+message is just a conversation with `is_group = false` and two participants,
+so group chat isn't a separate feature with its own tables and its own code
+path. It's the same path. My first instinct was to build DMs and groups
+separately, and that would have meant writing and testing every feature
+twice.
 
-I wanted a project that forced me to deal with the parts of "real-time"
-that are easy to hand-wave and hard to get right: what actually counts as
-delivered vs. seen, how a client and server stay in sync without endlessly
-polling, and how to structure a database so a feature like group chat isn't
-a bolted-on special case. A few decisions I made along the way:
+Message status lives in its own table, `message_status(message_id, user_id,
+status)`, with one row per recipient. I originally had a single `status`
+column on the message, which works right up until a group chat needs to show
+one person as "seen" and another as "delivered" at the same time. One column
+can't hold two answers. The tick the sender sees is computed by aggregating
+those rows, so the blue double check only appears once everyone has seen it.
 
-**One `conversations` table for both DMs and groups.** A direct message is
-just a conversation with `is_group = false` and exactly two participants.
-Early on I was tempted to build a separate table/API for 1:1 chats vs.
-groups, but that meant writing (and testing) every feature twice. Modeling
-a DM as "a group of two" collapsed that into one code path.
+**The frontend.** React with Vite. When you hit send, the message appears
+instantly with a clock icon before the server has answered. The client makes
+up a temporary ID, sends it along, and when the real message comes back it
+swaps the temp bubble for the real one by matching that ID. The message
+arrives twice, once as the HTTP response and once as the realtime broadcast,
+so without that matching you get every message rendered twice.
 
-**Delivery status lives in its own table, not a column on `messages`.**
-My first instinct was `messages.status = 'delivered'`. That breaks the
-moment you add group chats, one message can be seen by one person and
-merely delivered to another, at the same time, so a single column can't
-represent it. I ended up with `message_status(message_id, user_id, status)`,
-one row per recipient, and the "status" the sender sees is computed by
-aggregating those rows (seen only once *everyone* has seen it).
+**The realtime layer.** The browser holds a WebSocket open to Pusher.
+Everyone in a conversation subscribes to a channel for it, and the server
+broadcasts to that channel when something happens. Subscribing is gated by
+my own API, which checks the JWT and confirms you're actually in that
+conversation. Without that check, anyone who learned a conversation's ID
+could subscribe and read it.
 
-**Optimistic UI, reconciled by a `client_temp_id`.** When you hit send, the
-message appears instantly with a clock icon, before the server has even
-responded. The client generates a temporary ID, sends it along with the
-message, and when the server's real message comes back (via the socket ack
-*and* the room broadcast, which can both arrive), the client swaps the
-temp bubble for the real one by matching that ID instead of rendering it
-twice. Getting this to not double, or lose messages was the fiddliest part
-of the whole build.
+**Images** upload straight from the browser to Cloudinary. The API's only
+job is to sign the upload so the secret never reaches the browser.
 
-**Images go over REST, not the socket.** Everything else is a socket event,
-but file uploads need a real multipart HTTP request, so image messages hit
-a normal `POST` endpoint (handled with Multer) and the server broadcasts
-the resulting message over the socket afterward, so it still shows up live
-for everyone else exactly like a text message would.
+## Problems I ran into
 
-## How it works
+**Socket.IO doesn't work on Vercel, and I found out by deploying.** The
+first version was Express and Socket.IO as one long-running process. Vercel
+runs serverless functions, which exist for the length of one request. There
+is no process to hold a WebSocket open, and no guarantee two requests from
+the same user even hit the same instance. My room membership lived in
+Socket.IO's memory, so two instances wouldn't agree on who was online.
+Rewriting the realtime layer onto Pusher fixed it: the browser holds the
+connection, and my API only makes a short outbound call to say "broadcast
+this," which fits inside a function invocation.
 
-### Data model
+**A self-deadlock that took 10 seconds to fail.** Once I capped the Postgres
+pool at one connection per instance, sending a message started timing out.
+`createMessage` grabs the pool's connection to open a transaction, then
+called a helper that went back to the pool for a second connection to look
+up the participants, a connection only the transaction could release. It was
+waiting for itself. Sending a message went from **failing after 10,005 ms to
+a 3.6 ms median** once everything inside the transaction used the same
+connection. I only caught it because I wrote an end to end test script. It
+never showed up in normal development, because a default pool of 10 quietly
+hides it.
 
-```
-users ──< conversation_participants >── conversations ──< messages ──< message_status >── users
-```
+*How I measured it:* a loop that sends 200 messages one after another and
+records `performance.now()` before and after each request. Median 3.6 ms,
+95th percentile 7.2 ms, against a local Postgres.
 
-- `conversations` — one row per chat, `is_group` distinguishes a DM from a group
-- `conversation_participants` — who's in which conversation
-- `messages` — the message itself (text or image)
-- `message_status` — one row per (message, recipient), tracking `sent` /
-  `delivered` / `seen` independently for each person
+**Read receipts were spamming the realtime service.** Opening a conversation
+with 30 unread messages marks all 30 as seen at once, and I was sending one
+broadcast per message. Batching them into a single event with an array took
+that from **30 broadcasts down to 1, a 97% reduction**. The total bytes are
+about the same, so this isn't a bandwidth win. It matters because Pusher's
+free tier bills per message, and because the client was re-rendering 30
+times in a row instead of once.
 
-### Real-time flow (`server/src/sockets/index.js`)
+*How I measured it:* counted the broadcast calls the server makes when
+marking 30 messages seen, which is the same count you can watch live in
+Pusher's debug console.
 
-This file is the core of the app, everything about "is this message
-delivered yet" happens here:
+**Typing indicators were burning server calls for nothing.** Every keystroke
+burst was hitting my API just to tell one other person that someone was
+typing, which is information that's worthless 1.5 seconds later. I moved it
+to a Pusher client event that goes browser to browser, taking it from one
+server call per 1.5 seconds of typing to **zero**.
 
-1. The client connects with a JWT (`io(url, { auth: { token } })`). The
-   server verifies it and joins the socket to a personal room (`user:<id>`)
-   and to a room for every conversation that user is in
-   (`conversation:<id>`).
-2. **Sending**: client emits `message:send`. The server writes the message,
-   creates a `sent` status row per recipient, immediately upgrades any
-   *currently online* recipient to `delivered`, broadcasts `message:new` to
-   the room, and acks the sender directly.
-3. **Delivered while offline**: any message that was still `sent` flips to
-   `delivered` the moment its recipient reconnects.
-4. **Seen**: while a client has a conversation open, it emits
-   `message:seen` with the message IDs it just displayed. The server
-   updates those rows and broadcasts `message:status`, so the *sender's*
-   ticks update live, on their screen, without a refresh.
-5. **Typing / presence** follow the same broadcast-to-room pattern.
+**Too many database connections.** Every cold started instance was opening a
+pool of 10. I fired 50 concurrent queries at both settings and watched the
+connection count from Postgres itself. The pool of 10 **peaked at 13 open
+connections, and capping it at 1 peaked at 4, a 69% reduction**, with Neon's
+connection pooler doing the real pooling behind it.
 
-### Auth
+*How I measured it:* ran `SELECT count(*) FROM pg_stat_activity WHERE
+datname = 'chatter'` on a 5 ms interval while the 50 queries were running,
+and kept the highest number.
 
-Register/login hash the password with bcrypt and return a JWT. Every
-protected REST route checks `Authorization: Bearer <token>`
-(`middleware/auth.js`); the socket connection is authenticated the same
-way, once, at handshake time.
+**Image uploads had nowhere to land.** Vercel's filesystem is read only, so
+the Multer setup writing to a local folder had no disk to write to. Vercel
+also caps a request body at 4.5 MB, which is smaller than the 8 MB images I
+already allowed. Uploading directly to Cloudinary means an 8 MB image now
+sends **150 bytes through my API instead of 8,388,608, which is 99.998%
+less**. The API only returns the upload signature.
 
-## Project structure
+**A timing attack defence that didn't defend anything.** On login I compared
+against a dummy hash when no user was found, so the response time wouldn't
+reveal whether an email exists. The dummy string I'd used wasn't a valid
+bcrypt hash, so the comparison bailed out immediately instead of taking the
+same time as a real one, which leaked exactly what it was meant to hide.
+Replacing it with a real hash fixed it.
 
-```
-Chatter/
-├── server/                  Express + Socket.IO API
-│   └── src/
-│       ├── config/db.js         Postgres connection pool
-│       ├── db/schema.sql        Table definitions
-│       ├── db/migrate.js        Applies schema.sql
-│       ├── middleware/          auth.js (JWT check), upload.js (image uploads)
-│       ├── routes/              REST endpoints
-│       ├── controllers/         Request handlers
-│       ├── services/            Shared DB logic (used by both REST & sockets)
-│       ├── sockets/index.js     Real-time layer (the heart of the app)
-│       └── uploads/             Uploaded images live here
-└── client/                  React frontend (Vite)
-    └── src/
-        ├── api/              axios client + socket.io client
-        ├── context/AuthContext.jsx   Login state, token, connects the socket
-        ├── pages/            Login, Register, Chat (the main screen)
-        └── components/       ConversationList, ChatWindow, MessageBubble, NewConversationModal
-```
+**Unread counts drifting.** I was setting the "last read" pointer from the
+last row an `UPDATE ... RETURNING` handed back, assuming that was the newest
+message. SQL makes no promise about row order, so the pointer sometimes
+landed on an older message and the unread badge was wrong. It's now computed
+with an explicit `ORDER BY created_at DESC LIMIT 1`.
 
-## Getting started
+**Swapped bcrypt for bcryptjs.** `bcrypt` is a native module that has to be
+compiled for the exact build platform. `bcryptjs` is pure JavaScript with
+the same API and the same hash format, so it's one less thing that can break
+on a build machine I don't control.
 
-### 1. Install PostgreSQL (if you don't have it)
+## Running it locally
 
-```bash
-brew install postgresql@16
-brew services start postgresql@16
-```
-
-### 2. Create the database and a user
-
-```bash
-createuser chatter_user --pwprompt   # set password to chatter_pass, or your own
-createdb chatter -O chatter_user
-```
-
-(Using different names? Update the values in the next step to match.)
-
-### 3. Configure environment variables
-
-```bash
-cd server
-cp .env.example .env
-# edit .env if you used different DB credentials, and set JWT_SECRET to a
-# random string, e.g.:
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-```
-
-```bash
-cd ../client
-cp .env.example .env
-```
-
-### 4. Install dependencies and create the tables
-
-From the project root:
+You'll need PostgreSQL, plus free Pusher and Cloudinary accounts for
+realtime and images. Copy `server/.env.example` to `server/.env` and
+`client/.env.example` to `client/.env`, then fill them in.
 
 ```bash
 npm run install:all
-npm run db:migrate --prefix server
-```
-
-### 5. Run it
-
-From the project root, this starts both the API server (port 4000) and the
-Vite dev server (port 5173) together:
-
-```bash
+npm run db:migrate
 npm run dev
 ```
 
-Open http://localhost:5173, register two different accounts (e.g. one in a
-normal window, one in an incognito window), and message between them to see
-delivery/seen status update live.
+That starts the API on port 4000 and the frontend on 5173. Register two
+accounts in two windows (one incognito) and message between them to see the
+ticks update live.
 
-## Trying it out
+Without Pusher and Cloudinary configured the app still runs. Messages send
+and load, they just don't appear until you refresh, and the image button
+returns an error.
 
-- **1:1 chat**: "+ New conversation" → search a username → select them (no
-  group name) → "Start chat".
-- **Group chat**: select two or more people, give the group a name, "Create
-  group".
-- **Images**: click the 📎 button in the composer.
-- **Status ticks**: 🕓 sending · ✓ sent · ✓✓ (grey) delivered · ✓✓ (blue) seen.
+## Deploying
+
+Postgres on Neon (use the pooled connection string, the host ending in
+`-pooler`), a Pusher Channels app with client events enabled in its settings,
+and a Cloudinary account. Import the repo into Vercel, where the build config
+is already in `vercel.json`, and set these environment variables:
+`DATABASE_URL`, `JWT_SECRET`, `JWT_EXPIRES_IN`, `PUSHER_APP_ID`,
+`PUSHER_KEY`, `PUSHER_SECRET`, `PUSHER_CLUSTER`, `CLOUDINARY_CLOUD_NAME`,
+`CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`, `VITE_PUSHER_KEY`,
+`VITE_PUSHER_CLUSTER`.
+
+Anything starting with `VITE_` gets baked into the JavaScript the browser
+downloads, so it's public. That's fine for the Pusher key, since channel
+access is granted by my API and not by the key, but no secret goes in one.
 
 ## What I'd add next
 
-- Message editing/deleting
-- Push notifications when the app isn't focused
-- Read-receipt avatars in group chats (see exactly who has seen it, not
-  just the aggregate tick)
-- A "load older messages" UI for scrolling up (the API already supports
-  cursor-based pagination via `?before=`, just needs a scroll listener)
-- Rate limiting on `/api/auth/*` and the image upload endpoint
+Message editing and deleting, push notifications when the app isn't focused,
+and read receipt avatars so you can see exactly who in a group has seen a
+message rather than just the aggregate tick. The API already does cursor
+based pagination for older messages, so that just needs a scroll listener on
+the frontend. I'd also keep the end to end test script I wrote while
+migrating, since it caught the deadlock immediately.
 
 ## About
 
-Built by Kareem, a Software Engineering student (co-op) at the University
-of Ottawa, as a project to practice building a real-time full-stack
-application end to end — schema design, a WebSocket layer, and the React
-frontend to go with it.
+Built by Kareem, a Software Engineering student (co-op) at the University of
+Ottawa.

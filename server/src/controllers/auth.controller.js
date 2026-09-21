@@ -1,4 +1,9 @@
-const bcrypt = require('bcrypt');
+// bcryptjs rather than bcrypt: the latter is a native addon that has to be
+// compiled or fetched as a prebuilt binary for the exact platform, which is a
+// standing risk on a build image you don't control and bloats the function
+// bundle. bcryptjs is pure JavaScript with the same API and the same hash
+// format, so existing password hashes keep verifying.
+const bcrypt = require('bcryptjs');
 const { query } = require('../config/db');
 const { signToken } = require('../utils/jwt');
 
@@ -45,9 +50,13 @@ async function login(req, res) {
     const { rows } = await query('SELECT * FROM users WHERE email = $1', [email]);
     const user = rows[0];
 
-    // Compare against a dummy hash even when no user is found, so the response
-    // time doesn't leak whether the email exists (basic timing-attack hygiene).
-    const passwordHash = user ? user.password_hash : '$2b$10$invalidsaltinvalidsaltinvalidsaltinvalidsalt';
+    // Compare against a real (but unmatchable) hash even when no user is
+    // found, so the response time doesn't leak whether the email exists.
+    // It has to be a well-formed bcrypt hash or the compare returns
+    // immediately and the timing tell comes back.
+    const passwordHash = user
+      ? user.password_hash
+      : '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy';
     const valid = await bcrypt.compare(password, passwordHash);
 
     if (!user || !valid) {

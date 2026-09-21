@@ -8,17 +8,7 @@
     "dev": "nodemon src/index.js",
     "db:migrate": "node src/db/migrate.js"
   },
-  "dependencies": {
-    "bcrypt": "^6.0.0",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.21.1",
-    "jsonwebtoken": "^9.0.2",
-    "morgan": "^1.10.0",
-    "multer": "^1.4.5-lts.1",
-    "pg": "^8.13.1",
-    "socket.io": "^4.8.1"
-  },
+  "//": "Runtime dependencies deliberately live in the ROOT package.json, not here. Vercel builds api/index.js from the repo root, so anything this code requires has to be installed there; Node's module resolution walks up from server/src and finds it either way, which keeps local dev and the deployed function on one identical dependency tree.",
   "devDependencies": {
     "nodemon": "^3.1.7"
   }

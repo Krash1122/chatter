@@ -1,5 +1,5 @@
-const { query } = require('../config/db');
 const convService = require('../services/conversations.service');
+const { trigger, userChannel } = require('../realtime/pusher');
 
 // POST /api/conversations  { participantId }
 async function createDirect(req, res, next) {
@@ -8,6 +8,7 @@ async function createDirect(req, res, next) {
     if (!participantId) return res.status(400).json({ error: 'participantId is required' });
 
     const conversationId = await convService.getOrCreateDirectConversation(req.user.id, participantId);
+    await notifyParticipants(conversationId, req.user.id);
     res.status(201).json({ conversationId });
   } catch (err) {
     next(err);
@@ -22,10 +23,26 @@ async function createGroup(req, res, next) {
       return res.status(400).json({ error: 'name and participantIds[] are required' });
     }
     const conversationId = await convService.createGroupConversation(req.user.id, name, participantIds);
+    await notifyParticipants(conversationId, req.user.id);
     res.status(201).json({ conversationId });
   } catch (err) {
     next(err);
   }
+}
+
+// The other members can't be subscribed to a conversation channel that didn't
+// exist when their page loaded, so they'd only discover a new chat on refresh.
+// A nudge on each member's personal channel tells them to refetch and
+// subscribe. This is what the old socket 'conversation:join' event covered,
+// except the server now initiates it instead of waiting for the creator's
+// client to ask.
+async function notifyParticipants(conversationId, creatorId) {
+  const participantIds = await convService.getParticipantIds(conversationId);
+  await Promise.all(
+    participantIds
+      .filter((id) => id !== creatorId)
+      .map((id) => trigger(userChannel(id), 'conversation-new', { conversationId }))
+  );
 }
 
 // GET /api/conversations
@@ -38,36 +55,4 @@ async function list(req, res, next) {
   }
 }
 
-// POST /api/conversations/:id/read  -- mark everything up to "now" as seen
-async function markRead(req, res, next) {
-  try {
-    const conversationId = req.params.id;
-    await convService.assertParticipant(conversationId, req.user.id);
-
-    const { rows } = await query(
-      `UPDATE message_status ms
-       SET status = 'seen', updated_at = now()
-       FROM messages m
-       WHERE ms.message_id = m.id
-         AND m.conversation_id = $1
-         AND ms.user_id = $2
-         AND ms.status != 'seen'
-       RETURNING ms.message_id`,
-      [conversationId, req.user.id]
-    );
-
-    if (rows[0]) {
-      await query(
-        `UPDATE conversation_participants SET last_read_message_id = $1
-         WHERE conversation_id = $2 AND user_id = $3`,
-        [rows[rows.length - 1].message_id, conversationId, req.user.id]
-      );
-    }
-
-    res.json({ markedSeen: rows.map((r) => r.message_id) });
-  } catch (err) {
-    next(err);
-  }
-}
-
-module.exports = { createDirect, createGroup, list, markRead };
+module.exports = { createDirect, createGroup, list };

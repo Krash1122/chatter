@@ -1,20 +1,31 @@
 // The active conversation: message history, the composer (text + image),
 // typing indicator, and marking incoming messages as seen.
+//
+// Sending used to be a socket emit with an acknowledgement callback; it's now
+// a POST whose response plays the same role. Receiving is a Pusher event on
+// the conversation's presence channel. Chat.jsx owns subscribing to that
+// channel, so this component only binds and unbinds its own handlers on it --
+// it must not unsubscribe, or it would cut off the sidebar too.
 import { useEffect, useRef, useState, useCallback } from 'react';
 import api from '../api/client';
-import { getSocket } from '../api/socket';
+import { getRealtime, subscribe, conversationChannelName } from '../api/realtime';
 import MessageBubble from './MessageBubble.jsx';
+
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+const ALLOWED_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 
 function upsertMessage(list, incoming) {
   // Replace an optimistic temp bubble once the server confirms it (matched
   // by client_temp_id), otherwise replace-or-append by real id so the same
-  // message never renders twice (REST response + socket broadcast both
-  // deliver it).
-  const byTempId = incoming.client_temp_id && list.findIndex((m) => m.id === incoming.client_temp_id);
-  if (byTempId !== undefined && byTempId !== -1 && byTempId !== false) {
-    const copy = [...list];
-    copy[byTempId] = incoming;
-    return copy;
+  // message never renders twice (the POST response and the Pusher broadcast
+  // both deliver it to the sender).
+  if (incoming.client_temp_id) {
+    const byTempId = list.findIndex((m) => m.id === incoming.client_temp_id);
+    if (byTempId !== -1) {
+      const copy = [...list];
+      copy[byTempId] = incoming;
+      return copy;
+    }
   }
   const byId = list.findIndex((m) => m.id === incoming.id);
   if (byId !== -1) {
@@ -29,10 +40,12 @@ export default function ChatWindow({ conversation, currentUser, onlineUsers }) {
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(true);
   const [draft, setDraft] = useState('');
+  const [error, setError] = useState('');
   const [typingUsers, setTypingUsers] = useState(new Set());
   const bottomRef = useRef(null);
   const fileInputRef = useRef(null);
   const typingTimeoutRef = useRef(null);
+  const channelRef = useRef(null);
   const conversationId = conversation.id;
 
   const otherName = conversation.is_group
@@ -41,14 +54,12 @@ export default function ChatWindow({ conversation, currentUser, onlineUsers }) {
 
   const markSeen = useCallback(
     (msgs) => {
-      const socket = getSocket();
-      if (!socket) return;
       const unseenIds = msgs
         .filter((m) => m.sender_id !== currentUser.id && !m.pending)
         .filter((m) => (m.statuses || []).some((s) => s.userId === currentUser.id && s.status !== 'seen'))
         .map((m) => m.id);
       if (unseenIds.length > 0) {
-        socket.emit('message:seen', { conversationId, messageIds: unseenIds });
+        api.post(`/conversations/${conversationId}/messages/seen`, { messageIds: unseenIds }).catch(() => {});
       }
     },
     [conversationId, currentUser.id]
@@ -56,18 +67,33 @@ export default function ChatWindow({ conversation, currentUser, onlineUsers }) {
 
   // Load history whenever the selected conversation changes.
   useEffect(() => {
+    let cancelled = false;
     setLoading(true);
-    api.get(`/conversations/${conversationId}/messages`).then(({ data }) => {
-      setMessages(data.messages);
-      setLoading(false);
-      markSeen(data.messages);
-    });
+    setError('');
+    api
+      .get(`/conversations/${conversationId}/messages`)
+      .then(({ data }) => {
+        if (cancelled) return;
+        setMessages(data.messages);
+        setLoading(false);
+        markSeen(data.messages);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setLoading(false);
+        setError('Could not load messages.');
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Socket listeners scoped to this conversation.
+  // Realtime listeners scoped to this conversation.
   useEffect(() => {
-    const socket = getSocket();
-    if (!socket) return;
+    if (!getRealtime()) return;
+    const channel = subscribe(conversationChannelName(conversationId));
+    if (!channel) return;
+    channelRef.current = channel;
 
     function onNewMessage(message) {
       if (message.conversation_id !== conversationId) return;
@@ -78,84 +104,121 @@ export default function ChatWindow({ conversation, currentUser, onlineUsers }) {
       });
     }
 
-    function onStatus({ messageId, userId, status }) {
+    // Status changes arrive batched, one event per burst.
+    function onStatus({ updates = [] }) {
+      if (updates.length === 0) return;
       setMessages((prev) =>
         prev.map((m) => {
-          if (m.id !== messageId) return m;
-          const statuses = m.statuses || [];
-          const idx = statuses.findIndex((s) => s.userId === userId);
-          const nextStatuses =
-            idx === -1
-              ? [...statuses, { userId, status }]
-              : statuses.map((s, i) => (i === idx ? { ...s, status } : s));
-          return { ...m, statuses: nextStatuses };
+          const forThis = updates.filter((u) => u.messageId === m.id);
+          if (forThis.length === 0) return m;
+          const statuses = [...(m.statuses || [])];
+          forThis.forEach(({ userId, status }) => {
+            const idx = statuses.findIndex((s) => s.userId === userId);
+            if (idx === -1) statuses.push({ userId, status });
+            else statuses[idx] = { ...statuses[idx], status };
+          });
+          return { ...m, statuses };
         })
       );
     }
 
-    function onTyping({ conversationId: cid, userId, isTyping }) {
-      if (cid !== conversationId || userId === currentUser.id) return;
+    // Typing is a client event: it goes browser -> Pusher -> browser without
+    // touching our API at all. There's no point spending a function
+    // invocation on something that's stale in 1.5 seconds.
+    function onTyping({ userId, isTyping }) {
+      if (userId === currentUser.id) return;
       setTypingUsers((prev) => {
         const next = new Set(prev);
-        isTyping ? next.add(userId) : next.delete(userId);
+        if (isTyping) next.add(userId);
+        else next.delete(userId);
         return next;
       });
     }
 
-    socket.on('message:new', onNewMessage);
-    socket.on('message:status', onStatus);
-    socket.on('typing', onTyping);
+    channel.bind('message-new', onNewMessage);
+    channel.bind('message-status', onStatus);
+    channel.bind('client-typing', onTyping);
+
     return () => {
-      socket.off('message:new', onNewMessage);
-      socket.off('message:status', onStatus);
-      socket.off('typing', onTyping);
+      // Unbind only our own handlers -- Chat.jsx has its own on this channel
+      // and owns the subscription itself.
+      channel.unbind('message-new', onNewMessage);
+      channel.unbind('message-status', onStatus);
+      channel.unbind('client-typing', onTyping);
+      channelRef.current = null;
     };
   }, [conversationId, currentUser.id, markSeen]);
+
+  // Reset the typing indicator when switching conversations.
+  useEffect(() => {
+    setTypingUsers(new Set());
+    return () => clearTimeout(typingTimeoutRef.current);
+  }, [conversationId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  function handleTyping(value) {
-    setDraft(value);
-    const socket = getSocket();
-    if (!socket) return;
-    socket.emit('typing:start', { conversationId });
-    clearTimeout(typingTimeoutRef.current);
-    typingTimeoutRef.current = setTimeout(() => {
-      socket.emit('typing:stop', { conversationId });
-    }, 1500);
+  function emitTyping(isTyping) {
+    try {
+      channelRef.current?.trigger('client-typing', { userId: currentUser.id, isTyping });
+    } catch {
+      // Client events are rejected until the subscription completes, and are
+      // off entirely unless enabled in the Pusher dashboard. Neither is worth
+      // interrupting typing over.
+    }
   }
 
-  function handleSend(e) {
-    e.preventDefault();
-    const body = draft.trim();
-    if (!body) return;
-    setDraft('');
+  function handleTyping(value) {
+    setDraft(value);
+    emitTyping(true);
+    clearTimeout(typingTimeoutRef.current);
+    typingTimeoutRef.current = setTimeout(() => emitTyping(false), 1500);
+  }
 
-    const clientTempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const optimistic = {
+  function optimisticBubble(clientTempId, fields) {
+    return {
       id: clientTempId,
       client_temp_id: clientTempId,
       conversation_id: conversationId,
       sender_id: currentUser.id,
-      type: 'text',
-      body,
       created_at: new Date().toISOString(),
       statuses: [],
       pending: true,
+      ...fields,
     };
-    setMessages((prev) => [...prev, optimistic]);
+  }
 
-    const socket = getSocket();
-    socket.emit('message:send', { conversationId, body, clientTempId }, (res) => {
-      if (res?.ok) {
-        setMessages((prev) => upsertMessage(prev, { ...res.message, statuses: [] }));
-      } else {
-        // Mark the bubble as failed rather than silently losing it.
-        setMessages((prev) => prev.map((m) => (m.id === clientTempId ? { ...m, failed: true, pending: false } : m)));
-      }
-    });
+  function newTempId() {
+    return `temp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+
+  function markFailed(clientTempId) {
+    setMessages((prev) =>
+      prev.map((m) => (m.id === clientTempId ? { ...m, failed: true, pending: false } : m))
+    );
+  }
+
+  async function handleSend(e) {
+    e.preventDefault();
+    const body = draft.trim();
+    if (!body) return;
+    setDraft('');
+    emitTyping(false);
+
+    const clientTempId = newTempId();
+    setMessages((prev) => [...prev, optimisticBubble(clientTempId, { type: 'text', body })]);
+
+    try {
+      const { data } = await api.post(`/conversations/${conversationId}/messages`, {
+        type: 'text',
+        body,
+        clientTempId,
+      });
+      setMessages((prev) => upsertMessage(prev, { ...data.message, statuses: [] }));
+    } catch {
+      markFailed(clientTempId);
+    }
   }
 
   async function handleImagePick(e) {
@@ -163,32 +226,60 @@ export default function ChatWindow({ conversation, currentUser, onlineUsers }) {
     e.target.value = '';
     if (!file) return;
 
-    const clientTempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const localUrl = URL.createObjectURL(file);
-    const optimistic = {
-      id: clientTempId,
-      client_temp_id: clientTempId,
-      conversation_id: conversationId,
-      sender_id: currentUser.id,
-      type: 'image',
-      image_url: localUrl,
-      created_at: new Date().toISOString(),
-      statuses: [],
-      pending: true,
-    };
-    setMessages((prev) => [...prev, optimistic]);
+    // multer used to enforce these server-side. The upload no longer passes
+    // through our server at all, so the check moves here (Cloudinary enforces
+    // its own limits too, but its errors are not worth showing a user).
+    if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
+      setError('Only PNG, JPEG, GIF or WEBP images are allowed.');
+      return;
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      setError('Images must be under 8MB.');
+      return;
+    }
+    setError('');
 
-    const formData = new FormData();
-    formData.append('image', file);
-    formData.append('clientTempId', clientTempId);
+    const clientTempId = newTempId();
+    const localUrl = URL.createObjectURL(file);
+    setMessages((prev) => [
+      ...prev,
+      optimisticBubble(clientTempId, { type: 'image', image_url: localUrl }),
+    ]);
 
     try {
-      const { data } = await api.post(`/conversations/${conversationId}/messages/image`, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
+      // 1. Ask our API to sign the upload. The Cloudinary secret stays server-side.
+      const { data: sig } = await api.get('/uploads/signature');
+
+      // 2. Upload straight to Cloudinary. Deliberately fetch, not the shared
+      //    axios instance -- that one attaches our JWT to every request, and
+      //    it has no business being sent to a third party.
+      const form = new FormData();
+      form.append('file', file);
+      form.append('api_key', sig.apiKey);
+      form.append('timestamp', sig.timestamp);
+      form.append('folder', sig.folder);
+      form.append('signature', sig.signature);
+
+      const uploadRes = await fetch(`https://api.cloudinary.com/v1_1/${sig.cloudName}/image/upload`, {
+        method: 'POST',
+        body: form,
+      });
+      if (!uploadRes.ok) throw new Error('Cloudinary upload failed');
+      const uploaded = await uploadRes.json();
+
+      // 3. Only now does a message row exist, pointing at the hosted URL.
+      const { data } = await api.post(`/conversations/${conversationId}/messages`, {
+        type: 'image',
+        imageUrl: uploaded.secure_url,
+        clientTempId,
       });
       setMessages((prev) => upsertMessage(prev, { ...data.message, statuses: [] }));
-    } catch (err) {
-      setMessages((prev) => prev.map((m) => (m.id === clientTempId ? { ...m, failed: true, pending: false } : m)));
+      // Only now that the bubble points at the hosted URL instead of the local
+      // preview -- revoking on failure would blank out the failed bubble.
+      URL.revokeObjectURL(localUrl);
+    } catch {
+      markFailed(clientTempId);
+      setError('Could not send that image.');
     }
   }
 
@@ -207,6 +298,8 @@ export default function ChatWindow({ conversation, currentUser, onlineUsers }) {
           ) : null}
         </div>
       </div>
+
+      {error && <div className="error">{error}</div>}
 
       <div className="message-list">
         {loading ? (

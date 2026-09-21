@@ -5,15 +5,16 @@ client/node_modules/
 
 # Environment variables
 .env
+.env.local
 server/.env
+client/.env
 
 # Build output
 client/dist/
 client/build/
 
-# Uploaded images (don't commit user content)
-server/src/uploads/*
-!server/src/uploads/.gitkeep
+# Vercel
+.vercel
 
 # Logs
 npm-debug.log*

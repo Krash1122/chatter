@@ -6,9 +6,8 @@
 //   seen       -> double blue check (EVERY recipient has seen it)
 // In a group chat "seen" only lights up once every member has seen it --
 // that's the same rule most group chat apps use.
-const API_ORIGIN = (import.meta.env.VITE_API_URL || 'http://localhost:4000/api').replace(/\/api\/?$/, '');
-
 function aggregateStatus(message) {
+  if (message.failed) return 'failed';
   if (message.pending) return 'sending';
   const statuses = message.statuses || [];
   if (statuses.length === 0) return 'sent';
@@ -18,6 +17,7 @@ function aggregateStatus(message) {
 }
 
 function StatusTick({ status }) {
+  if (status === 'failed') return <span className="tick tick-failed">⚠</span>;
   if (status === 'sending') return <span className="tick tick-clock">🕓</span>;
   if (status === 'sent') return <span className="tick">✓</span>;
   if (status === 'delivered') return <span className="tick">✓✓</span>;
@@ -34,11 +34,10 @@ export default function MessageBubble({ message, isOwn, senderName }) {
       <div className={`message-bubble ${isOwn ? 'own' : ''}`}>
         {!isOwn && senderName && <div className="sender-name">{senderName}</div>}
         {message.type === 'image' ? (
-          <img
-            className="message-image"
-            src={message.image_url.startsWith('http') ? message.image_url : `${API_ORIGIN}${message.image_url}`}
-            alt="shared"
-          />
+          // Images are absolute Cloudinary URLs now (or a blob: preview while
+          // the upload is still in flight), so there's no server origin to
+          // prepend the way there was when they were served off local disk.
+          <img className="message-image" src={message.image_url} alt="shared" />
         ) : (
           <div className="message-body">{message.body}</div>
         )}
