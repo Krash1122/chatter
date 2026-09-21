@@ -171,7 +171,4 @@ based pagination for older messages, so that just needs a scroll listener on
 the frontend. I'd also keep the end to end test script I wrote while
 migrating, since it caught the deadlock immediately.
 
-## About
 
-Built by Kareem, a Software Engineering student (co-op) at the University of
-Ottawa.
