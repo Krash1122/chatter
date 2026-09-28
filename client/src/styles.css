@@ -29,6 +29,9 @@ input { font-family: inherit; }
 .auth-card input { padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px; }
 .auth-card button[type="submit"] { padding: 10px; border: none; border-radius: 8px; background: var(--primary); color: white; font-weight: 600; }
 .auth-card button[type="submit"]:hover { background: var(--primary-dark); }
+/* Error-boundary fallback reuses the auth card, but its buttons aren't in a form. */
+.auth-card > button:not([type="submit"]) { padding: 10px; border: none; border-radius: 8px; background: var(--primary); color: white; font-weight: 600; cursor: pointer; }
+.auth-card > button.secondary { background: #eef0f3; color: var(--text); }
 .auth-card .switch { text-align: center; font-size: 13px; color: var(--text-muted); }
 .error { background: #fde2e2; color: #b42318; padding: 8px 12px; border-radius: 8px; font-size: 13px; }
 

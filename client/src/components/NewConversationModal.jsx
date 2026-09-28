@@ -14,8 +14,12 @@ export default function NewConversationModal({ onClose, onCreated }) {
     const q = e.target.value;
     setQuery(q);
     if (q.trim().length === 0) return setResults([]);
-    const { data } = await api.get('/users/search', { params: { q } });
-    setResults(data.users.filter((u) => !selected.some((s) => s.id === u.id)));
+    try {
+      const { data } = await api.get('/users/search', { params: { q } });
+      setResults((data?.users || []).filter((u) => !selected.some((s) => s.id === u.id)));
+    } catch {
+      setError('Could not search users');
+    }
   }
 
   function toggleSelect(user) {

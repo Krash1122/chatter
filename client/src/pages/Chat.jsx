@@ -32,7 +32,15 @@ export default function Chat() {
   const channelsRef = useRef(new Map());
 
   const refreshConversations = useCallback(
-    () => api.get('/conversations').then(({ data }) => setConversations(data.conversations)),
+    () =>
+      api
+        .get('/conversations')
+        .then(({ data }) => {
+          // Anything but the expected array (an HTML error page, a proxy's 404)
+          // would crash every .map() below and blank the whole page.
+          if (Array.isArray(data?.conversations)) setConversations(data.conversations);
+        })
+        .catch((err) => console.error('Could not load conversations', err)),
     []
   );
 

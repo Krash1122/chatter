@@ -74,9 +74,10 @@ export default function ChatWindow({ conversation, currentUser, onlineUsers }) {
       .get(`/conversations/${conversationId}/messages`)
       .then(({ data }) => {
         if (cancelled) return;
-        setMessages(data.messages);
+        const history = Array.isArray(data?.messages) ? data.messages : [];
+        setMessages(history);
         setLoading(false);
-        markSeen(data.messages);
+        markSeen(history);
       })
       .catch(() => {
         if (cancelled) return;

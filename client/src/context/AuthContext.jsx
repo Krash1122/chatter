@@ -26,6 +26,7 @@ export function AuthProvider({ children }) {
         localStorage.removeItem('chatter_token');
         disconnectRealtime();
         setToken(null);
+        setUser(null);
       })
       .finally(() => setLoading(false));
   }, [token]);
